@@ -9,10 +9,9 @@ resource "aws_security_group" "efs" {
     from_port   = 2049
     to_port     = 2049
     protocol    = "tcp"
-    cidr_blocks = []
+    cidr_blocks = ["10.20.0.0/16"]
     # For now, allow from all private subnets. For stricter, wire up referencing ECS SG, see below.
-    security_groups = []
-    self            = true
+    security_groups = [aws_security_group.datasync.arn, aws_security_group.efs.arn]
   }
   egress {
     from_port   = 443
@@ -24,12 +23,11 @@ resource "aws_security_group" "efs" {
   tags = { Name = "${var.efs_name}-efs-sg" }
 }
 
-# Security group for DataSync ENI
 resource "aws_security_group" "datasync" {
+  # checkov:skip=CKV2_AWS_5: Datasync will create this and attach to ENI once the job starts
   name        = "${var.efs_name}-datasync-sg"
   vpc_id      = var.vpc_id
-  description = "DataSync agent/task ENI"
-  # Needs to connect to EFS (NFS, port 2049) and S3 (via NAT/VPC endpoint)
+  description = "Allow DataSync to EFS"
   egress {
     from_port   = 443
     to_port     = 443
@@ -37,7 +35,6 @@ resource "aws_security_group" "datasync" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  tags = { Name = "${var.efs_name}-datasync-sg" }
 }
 
 # Update EFS SG ingress to allow from DataSync SG

@@ -43,7 +43,7 @@ module "alb" {
   listener_port       = 443
   alb_protocol        = "HTTPS"
   certificate_arn     = var.sonarqube_acm_cert_arn
-  allowed_cidr_blocks = ["10.20.0.0/16"] # Or wherever your expected sonarscanners live             # Internal net
+  allowed_cidr_blocks = ["10.20.0.0/16"] # Or wherever your expected sonarscanners live
   health_check_path   = "/api/system/health"
 }
 
@@ -62,7 +62,7 @@ module "ecs" {
   db_secret_arn         = module.rds.db_secret_arn
   db_iam_auth           = module.rds.iam_auth_enabled
   rds_security_group_id = module.rds.security_group_id
-  image                 = "sonarqube:9.9-enterprise"
+  image                 = "2025.4.0-enterprise"
   extra_env = [
     { name = "SONARQUBE_LICENSE", value = var.sonarqube_license }
     # other env as needed
