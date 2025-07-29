@@ -1,0 +1,114 @@
+name: SonarQube Module Deploy
+
+permissions:
+  content: read
+  id-token: write
+
+on:
+  workflow_call:
+    inputs:
+      module:
+        required: true
+        type: string
+      tfvars:
+        required: true
+        type: string
+      do_db_migration:
+        required: false
+        default: 'false'
+        type: string
+      # Add other flags as needed (e.g. do_pluginsync)
+    secrets:
+      AWS_ACCESS_KEY_ID: { required: true }
+      AWS_SECRET_ACCESS_KEY: { required: true }
+      AWS_REGION: { required: true }
+
+jobs:
+  plan-and-apply:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/sonarqube-deployer
+          aws-region: eu-central-1
+      - name: Install terraform
+        run: |
+          curl -Lo /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip && \
+          unzip -o /tmp/terraform.zip -d /tmp && \
+          sudo mv /tmp/terraform /usr/local/bin/terraform && \
+          rm /tmp/terraform.zip
+      - name: Terraform Init
+        run: terraform init
+      - name: Terraform Plan
+        run: terraform plan -target=module.${{ inputs.module }} -var-file=${{ inputs.tfvars }} -out=tfplan
+      - name: Terraform Apply
+        run: terraform apply -var-file=${{ inputs.tfvars }} -auto-approve tfplan
+      - name: Generate Terraform outputs (JSON)
+        run: terraform output -json > tf-outputs.json
+      - name: Upload TF outputs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs
+          path: tf-outputs.json
+
+  ecs-migration:
+    if: ${{ inputs.module == 'ecs' && inputs.do_db_migration == 'true' }}
+    needs: plan-and-apply
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drain ECS Service
+        run: |
+          aws ecs update-service --cluster sonarqube --service sonarqube --desired-count 0 --region ${{ secrets.AWS_REGION }}
+          aws ecs wait services-stable --cluster sonarqube --services sonarqube --region ${{ secrets.AWS_REGION }}
+      - name: Run DB Migration Task
+        run: |
+          # This assumes you have a migration task def. Substitute your logic.
+          TASK_ARN=$(aws ecs run-task --cluster sonarqube --task-definition sonarqube-migration:1 --launch-type FARGATE --network-configuration 'awsvpcConfiguration={...}' --region ${{ secrets.AWS_REGION }} --query 'tasks[0].taskArn' --output text)
+          # Poll for migration completion
+          for i in {1..30}; do
+            STATUS=$(aws ecs describe-tasks --cluster sonarqube --tasks $TASK_ARN --region ${{ secrets.AWS_REGION }} --query 'tasks[0].lastStatus' --output text)
+            [ "$STATUS" = "STOPPED" ] && break
+            sleep 10
+          done
+          EXIT_CODE=$(aws ecs describe-tasks --cluster sonarqube --tasks $TASK_ARN --region ${{ secrets.AWS_REGION }} --query 'tasks[0].containers[0].exitCode' --output text)
+          [ "$EXIT_CODE" != "0" ] && { echo "Migration failed!"; exit 1; }
+
+      - name: Restore ECS Service
+        run: aws ecs update-service --cluster sonarqube --service sonarqube --desired-count 1 --region ${{ secrets.AWS_REGION }}
+
+  pluginsync:
+    if: ${{ inputs.module == 'ecs' }}
+    needs: [plan-and-apply, ecs-migration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload Plugins to S3
+        run: aws s3 sync plugins/ s3://my-sonarqube-plugins/
+      - name: Trigger DataSync Task
+        run: |
+          DATASYNC_TASK_ARN="arn:aws:datasync:eu-central-1:...:task/..."  # Output or secret
+          EXEC_ARN=$(aws datasync start-task-execution --task-arn $DATASYNC_TASK_ARN --region ${{ secrets.AWS_REGION }} --query 'TaskExecutionArn' --output text)
+          # Poll for DataSync completion
+          for i in {1..30}; do
+            STATUS=$(aws datasync describe-task-execution --task-execution-arn $EXEC_ARN --region ${{ secrets.AWS_REGION }} --query 'Status' --output text)
+            [ "$STATUS" = "SUCCESS" ] && break
+            [ "$STATUS" = "ERROR" ] && { echo "DataSync failed!"; exit 1; }
+            sleep 15
+          done
+
+  healthcheck:
+    if: ${{ inputs.module == 'ecs' }}
+    needs: pluginsync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health Check SonarQube
+        run: |
+          for i in {1..15}; do
+            STATUS=$(curl -sk https://sonarqube.internal.company.com/api/system/health | grep '"status":"UP"' || true)
+            [ -n "$STATUS" ] && exit 0
+            sleep 10
+          done
+          echo "SonarQube did not become healthy in time!"
+          exit 1

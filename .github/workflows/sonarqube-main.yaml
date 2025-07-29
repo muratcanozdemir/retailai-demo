@@ -1,0 +1,119 @@
+name: SonarQube Main Infra CD
+
+permissions:
+  content: read
+  id-token: write
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  TFVARS_FILE: env/prod.tfvars
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      ecs: ${{ steps.filter.outputs.ecs }}
+      rds: ${{ steps.filter.outputs.rds }}
+      alb: ${{ steps.filter.outputs.alb }}
+      efs: ${{ steps.filter.outputs.efs }}
+      datasync: ${{ steps.filter.outputs.datasync }}
+      dns: ${{ steps.filter.outputs.dns }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ecs:
+              - 'modules/ecs/**'
+              - 'env/prod.tfvars'
+            rds:
+              - 'modules/rds/**'
+              - 'env/prod.tfvars'
+            alb:
+              - 'modules/alb/**'
+              - 'env/prod.tfvars'
+            efs:
+              - 'modules/efs-datasync/**'
+              - 'env/prod.tfvars'
+            datasync:
+              - 'modules/efs-datasync/**'
+              - 'env/prod.tfvars'
+            dns:
+              - 'modules/dns/**'
+              - 'env/prod.tfvars'
+
+  check-version:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ecs == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      do_db_migration: ${{ steps.compare.outputs.upgrade }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get Deployed Version
+        id: deployed
+        run: |
+          # Fetch ECS task def or SonarQube version
+          # Store to deployed_version.txt
+          echo "9.9" > deployed_version.txt  # placeholder, implement real extraction
+      - name: Get Target Version
+        id: target
+        run: |
+          # Get target version from repo/tag
+          echo "9.9" > target_version.txt
+      - name: Compare
+        id: compare
+        run: |
+          DEPLOYED=$(cat deployed_version.txt)
+          TARGET=$(cat target_version.txt)
+          if [ "$DEPLOYED" != "$TARGET" ]; then
+            echo "upgrade=true" >> $GITHUB_OUTPUT
+          else
+            echo "upgrade=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy-ecs:
+    needs: [detect-changes, check-version]
+    if: needs.detect-changes.outputs.ecs == 'true'
+    uses: ./.github/workflows/sonarqube-module-deploy.yaml
+    with:
+      module: "ecs"
+      tfvars: ${{ env.TFVARS_FILE }}
+      do_db_migration: ${{ needs.check-version.outputs.do_db_migration }}
+
+  deploy-rds:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.rds == 'true'
+    uses: ./.github/workflows/sonarqube-module-deploy.yaml
+    with:
+      module: "rds"
+      tfvars: ${{ env.TFVARS_FILE }}
+
+  deploy-alb:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.alb == 'true'
+    uses: ./.github/workflows/sonarqube-module-deploy.yaml
+    with:
+      module: "alb"
+      tfvars: ${{ env.TFVARS_FILE }}
+
+  deploy-efs:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.efs == 'true'
+    uses: ./.github/workflows/sonarqube-module-deploy.yaml
+    with:
+      module: "efs-datasync"
+      tfvars: ${{ env.TFVARS_FILE }}
+
+  deploy-dns:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.dns == 'true'
+    uses: ./.github/workflows/sonarqube-module-deploy.yaml
+    with:
+      module: "dns"
+      tfvars: ${{ env.TFVARS_FILE }}
